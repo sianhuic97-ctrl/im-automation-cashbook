@@ -1,0 +1,1221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IM Automation — Cash Book Ledger</title>
+
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import { getAuth, signInWithPopup, signInWithRedirect, getRedirectResult, signOut, onAuthStateChanged, GoogleAuthProvider } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+  import { getFirestore, collection, doc, addDoc, deleteDoc, onSnapshot, query, orderBy, setDoc } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+  const FIREBASE_CONFIG = {
+    apiKey: "AIzaSyBvrce1GznAHXZ6iNqOe4zQdAfyQ7h6wjQ",
+    authDomain: "im-automation---cashbook.firebaseapp.com",
+    projectId: "im-automation---cashbook",
+    storageBucket: "im-automation---cashbook.firebasestorage.app",
+    messagingSenderId: "1075737677058",
+    appId: "1:1075737677058:web:b3821c680dc3746311c61b",
+    measurementId: "G-55B7F5BZLW"
+  };
+
+  const GEMINI_KEY_DEFAULT = "YOUR_GEMINI_API_KEY";
+  const SHEETS_ID_DEFAULT  = "YOUR_GOOGLE_SHEET_ID";
+
+  const app  = initializeApp(FIREBASE_CONFIG);
+  const auth = getAuth(app);
+  const db   = getFirestore(app);
+  const provider = new GoogleAuthProvider();
+  provider.addScope("https://www.googleapis.com/auth/spreadsheets");
+
+  let currentUser = null, googleToken = null;
+  let transactions = [], cashiers = ["Cheong Sian Ley","Cheong Sian Dy","Ng Pek Hoon","Cheong Nium Chee"];
+  let startingBalance = 0, selectedCashier = cashiers[0];
+  let filterFlow = "all", filterSearch = "", filterFrom = "", filterTo = "";
+  let unsubTx, unsubSettings;
+
+  const RM  = n => "RM " + (parseFloat(n)||0).toLocaleString("en-MY",{minimumFractionDigits:2,maximumFractionDigits:2});
+  const el  = id => document.getElementById(id);
+  const fmt = n => (parseFloat(n)||0).toLocaleString("en-MY",{minimumFractionDigits:2,maximumFractionDigits:2});
+
+  function toast(msg, type="ok") {
+    const t = el("toast");
+    t.textContent = msg;
+    t.className = "toast show " + type;
+    setTimeout(() => t.classList.remove("show"), 3500);
+  }
+
+  function setSyncStatus(s) {
+    const map = { live:["#10B981","● LIVE"], connecting:["#F59E0B","◌ Connecting…"], offline:["#94A3B8","○ Offline"], error:["#EF4444","✕ Error"] };
+    el("sync-dot").style.color = map[s][0];
+    el("sync-label").textContent = map[s][1];
+  }
+
+  // ── AUTH ──
+  window.handleLogin = async () => {
+    try {
+      setSyncStatus("connecting");
+      el("btn-login").textContent = "Connecting…";
+      try {
+        const result = await signInWithPopup(auth, provider);
+        const cred = GoogleAuthProvider.credentialFromResult(result);
+        googleToken = cred?.accessToken || null;
+        toast("Signed in — live sync active ✓");
+      } catch(popupErr) {
+        if (popupErr.code === 'auth/popup-blocked' || popupErr.code === 'auth/popup-closed-by-user' || popupErr.code === 'auth/cancelled-popup-request') {
+          toast("Redirecting to Google sign-in…");
+          await signInWithRedirect(auth, provider);
+        } else {
+          throw popupErr;
+        }
+      }
+    } catch(e) {
+      setSyncStatus("error");
+      el("btn-login").textContent = "Live Team Sync (Google Login)";
+      toast("Sign-in failed: "+e.message,"err");
+    }
+  };
+
+  // Handle redirect result when page loads after Google redirect
+  getRedirectResult(auth).then(result => {
+    if (result) {
+      const cred = GoogleAuthProvider.credentialFromResult(result);
+      googleToken = cred?.accessToken || null;
+      toast("Signed in successfully ✓");
+    }
+  }).catch(e => { if (e.code !== 'auth/no-auth-event') console.warn("Redirect:", e.message); });
+
+  window.handleLogout = async () => {
+    await signOut(auth); googleToken = null; setSyncStatus("offline");
+    el("btn-login").style.display=""; el("btn-logout").style.display="none"; el("user-name").textContent="";
+    toast("Signed out");
+  };
+
+  onAuthStateChanged(auth, user => {
+    currentUser = user;
+    if (user) {
+      el("btn-login").style.display="none"; el("btn-logout").style.display="";
+      el("user-name").textContent = user.displayName || user.email;
+      setSyncStatus("connecting");
+      subscribeFirestore();
+    } else {
+      setSyncStatus("offline"); renderAll();
+    }
+  });
+
+  // ── FIRESTORE ──
+  function subscribeFirestore() {
+    if (unsubTx) unsubTx();
+    if (unsubSettings) unsubSettings();
+    const q = query(collection(db,"transactions"), orderBy("createdAt","asc"));
+    unsubTx = onSnapshot(q, snap => {
+      transactions = snap.docs.map(d => ({id:d.id,...d.data()}));
+      setSyncStatus("live"); renderAll();
+    }, err => { setSyncStatus("error"); toast("Sync error: "+err.message,"err"); });
+    unsubSettings = onSnapshot(doc(db,"settings","main"), snap => {
+      if (snap.exists()) {
+        startingBalance = snap.data().startingBalance || 0;
+        if (snap.data().cashiers) { cashiers = snap.data().cashiers; renderCashierBtns(); }
+        el("starting-bal-input").value = startingBalance;
+        renderStats();
+      }
+    });
+  }
+
+  async function saveSettings() {
+    if (currentUser) await setDoc(doc(db,"settings","main"),{startingBalance,cashiers,updatedAt:new Date().toISOString()});
+  }
+
+  async function addTx(tx) {
+    if (currentUser) await addDoc(collection(db,"transactions"),{...tx,createdAt:new Date().toISOString()});
+    else { transactions.push({...tx,id:"local-"+Date.now(),createdAt:new Date().toISOString()}); renderAll(); }
+  }
+
+  async function deleteTx(id) {
+    if (currentUser) await deleteDoc(doc(db,"transactions",id));
+    else { transactions = transactions.filter(t=>t.id!==id); renderAll(); }
+  }
+
+  // ── GEMINI PDF ──
+  window.handlePdfUpload = async (input) => {
+    const file = input.files[0]; if (!file) return;
+    let key = localStorage.getItem("gemini_key") || GEMINI_KEY_DEFAULT;
+    if (!key || key === "YOUR_GEMINI_API_KEY") {
+      const entered = prompt("Enter your Gemini API key to enable PDF reading:\n(Get free key at aistudio.google.com/apikey)");
+      if (!entered || !entered.trim()) { toast("Gemini API key required to read PDF","err"); return; }
+      key = entered.trim();
+      localStorage.setItem("gemini_key", key);
+      const inp = el("gemini-key-input"); if (inp) inp.value = key;
+      toast("Gemini key saved ✓");
+    }
+    showPdfStatus("loading", `Reading ${file.name}…`);
+    try {
+      const b64 = await toBase64(file);
+      const mimeType = file.type || "application/pdf";
+      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${key}`,{
+        method:"POST", headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({ contents:[{parts:[
+          {inline_data:{mime_type: mimeType, data:b64}},
+          {text:`Analyse this document and extract the following fields.
+
+First, detect the document type:
+- If it says INVOICE, TAX INVOICE, or similar → docType = "Invoice"
+- If it says CASH SALES, CASH BILL, RECEIPT, or similar → docType = "Cash Sales Bill"
+- If unclear → docType = "Document"
+
+Then extract:
+1. Document/reference number (Invoice No, Bill No, Receipt No, etc.)
+2. Date
+3. Customer or client name — the BUYER, not the issuer/seller
+4. Final total amount payable (labeled GROSS, TOTAL, NET, AMOUNT DUE — the largest final number)
+5. Brief description of items/services (max 80 characters, summarise the main items)
+
+Reply ONLY with raw JSON, no markdown, no explanation:
+{"docType":"Invoice","refNo":"...","date":"...","client":"...","amount":0.00,"description":"..."}`}
+        ]}], generationConfig:{temperature:0,maxOutputTokens:400}})
+      });
+      if (!res.ok) throw new Error("HTTP "+res.status);
+      const data = await res.json();
+      const text = data.candidates?.[0]?.content?.parts?.[0]?.text||"";
+      const parsed = JSON.parse(text.replace(/```[a-z]*/g,"").replace(/```/g,"").trim());
+      el("f-invno").value   = parsed.refNo || "";
+      el("f-date").value    = parsed.date || "";
+      el("f-client").value  = parsed.client || "";
+      el("f-amount").value  = parsed.amount > 0 ? parseFloat(parsed.amount).toFixed(2) : "";
+      el("f-desc").value    = parsed.description || "";
+      calcChange();
+      const docType = parsed.docType || "Document";
+      const icon = docType === "Cash Sales Bill" ? "🧾" : "📄";
+      showPdfStatus("ok", `${icon} ${docType} detected — ${file.name}`);
+      const invLabel = el("inv-no-label");
+      if (invLabel) invLabel.textContent = docType === "Cash Sales Bill" ? "Bill No." : "Invoice No.";
+    } catch(e) { showPdfStatus("err","❌ Could not read: "+e.message); }
+  };
+          {text:`Analyse this document and extract the following fields.
+
+First, detect the document type:
+- If it says INVOICE, TAX INVOICE, or similar → docType = "Invoice"
+- If it says CASH SALES, CASH BILL, RECEIPT, or similar → docType = "Cash Sales Bill"
+- If unclear → docType = "Document"
+
+Then extract:
+1. Document/reference number (Invoice No, Bill No, Receipt No, etc.)
+2. Date
+3. Customer or client name — the BUYER, not the issuer/seller
+4. Final total amount payable (labeled GROSS, TOTAL, NET, AMOUNT DUE — the largest final number)
+5. Brief description of items/services (max 80 characters, summarise the main items)
+
+Reply ONLY with raw JSON, no markdown, no explanation:
+{"docType":"Invoice","refNo":"...","date":"...","client":"...","amount":0.00,"description":"..."}`}
+        ]}], generationConfig:{temperature:0,maxOutputTokens:400}})
+      });
+      if (!res.ok) throw new Error("HTTP "+res.status);
+      const data = await res.json();
+      const text = data.candidates?.[0]?.content?.parts?.[0]?.text||"";
+      const parsed = JSON.parse(text.replace(/```[a-z]*/g,"").replace(/```/g,"").trim());
+
+      // Auto-fill all fields
+      el("f-invno").value   = parsed.refNo || "";
+      el("f-date").value    = parsed.date || "";
+      el("f-client").value  = parsed.client || "";
+      el("f-amount").value  = parsed.amount > 0 ? parseFloat(parsed.amount).toFixed(2) : "";
+      el("f-desc").value    = parsed.description || "";
+      calcChange();
+
+      // Show doc type in status
+      const docType = parsed.docType || "Document";
+      const icon = docType === "Cash Sales Bill" ? "🧾" : "📄";
+      showPdfStatus("ok", `${icon} ${docType} detected — ${file.name}`);
+
+      // Update the Invoice No label to match doc type
+      const invLabel = el("inv-no-label");
+      if (invLabel) invLabel.textContent = docType === "Cash Sales Bill" ? "Bill No." : "Invoice No.";
+
+    } catch(e) { showPdfStatus("err","❌ Could not read: "+e.message); }
+  };
+
+  function showPdfStatus(type, msg) {
+    const s = el("pdf-status"); s.style.display="flex"; s.className="pdf-status "+type;
+    s.innerHTML = type==="loading"?`<div class="spinner"></div>${msg}`:msg;
+  }
+
+  function toBase64(file) {
+    return new Promise((res,rej)=>{ const r=new FileReader(); r.onload=()=>res(r.result.split(",")[1]); r.onerror=()=>rej(new Error("fail")); r.readAsDataURL(file); });
+  }
+
+  let paymentType = "full"; // "full" or "partial"
+
+  window.setPaymentType = (type) => {
+    paymentType = type;
+    el("pay-full").classList.toggle("active", type === "full");
+    el("pay-partial").classList.toggle("active", type === "partial");
+    el("full-pay-section").style.display = type === "full" ? "" : "none";
+    el("partial-pay-section").style.display = type === "partial" ? "" : "none";
+    calcChange();
+  };
+
+  window.calcPartial = () => {
+    const due   = parseFloat(el("f-amount").value)||0;
+    const paid  = parseFloat(el("f-partial").value)||0;
+    const outstanding = Math.max(0, due - paid);
+    const method = el("f-balance-method")?.value || "";
+
+    el("p-due").textContent         = due  > 0 ? "RM "+fmt(due)         : "RM —";
+    el("p-paid").textContent        = paid > 0 ? "RM "+fmt(paid)        : "RM —";
+    el("p-outstanding").textContent = outstanding > 0 ? "RM "+fmt(outstanding) : paid >= due ? "✅ Fully paid" : "RM —";
+    el("partial-box").className = "partial-box" + (outstanding > 0 ? " has-outstanding" : "");
+
+    const noteMap = {
+      "Pay Later (Cash)": `⏳ Balance RM ${fmt(outstanding)} to be paid in cash next visit`,
+      "Bank Transfer":    `🏦 Balance RM ${fmt(outstanding)} to be settled via Bank Transfer`,
+      "TNG / E-Wallet":   `📱 Balance RM ${fmt(outstanding)} to be settled via TNG / E-Wallet`,
+      "Cheque":           `📝 Balance RM ${fmt(outstanding)} to be settled via Cheque`
+    };
+    el("partial-note").textContent = method && outstanding > 0
+      ? noteMap[method]
+      : "📋 Select how the outstanding balance will be settled";
+    checkReady();
+  };
+
+  window.calcChange = () => {
+    if (paymentType === "partial") { calcPartial(); return; }
+    const due = parseFloat(el("f-amount").value)||0;
+    const cash = parseFloat(el("f-tendered").value)||0;
+    const box=el("change-box"), amt=el("change-amt"), sub=el("change-sub");
+    el("short-warn").style.display="none";
+    if (cash<=0||due<=0) { amt.textContent="RM —"; sub.textContent="Enter cash amount above"; box.className="change-box"; }
+    else if (cash<due) { amt.textContent=`RM ${(due-cash).toFixed(2)} short`; sub.textContent="Insufficient cash"; box.className="change-box warn"; el("short-warn").style.display="flex"; }
+    else { const ch=(cash-due).toFixed(2); amt.textContent=`RM ${ch}`; sub.textContent=ch==="0.00"?"Exact — no change":"Return to client"; box.className="change-box ok"; }
+    checkReady();
+  };
+
+  window.checkReady = () => {
+    const due = parseFloat(el("f-amount").value)||0;
+    const client = el("f-client").value.trim();
+    if (paymentType === "full") {
+      const cash = parseFloat(el("f-tendered").value)||0;
+      el("btn-record").disabled = !(due>0 && cash>=due && client && selectedCashier);
+    } else {
+      const paid   = parseFloat(el("f-partial").value)||0;
+      const method = el("f-balance-method")?.value || "";
+      el("btn-record").disabled = !(due>0 && paid>0 && paid<due && method && client && selectedCashier);
+    }
+  };
+
+  // ── RECORD ──
+  window.recordTransaction = async () => {
+    const due = parseFloat(el("f-amount").value)||0;
+    const docType = el("inv-no-label") ? (el("inv-no-label").textContent === "Bill No." ? "Cash Sales Bill" : "Invoice") : "Invoice";
+    let tx;
+
+    if (paymentType === "partial") {
+      const paid         = parseFloat(el("f-partial").value)||0;
+      const outstanding  = parseFloat((due - paid).toFixed(2));
+      const balanceMethod = el("f-balance-method")?.value || "";
+      const remarks = `Partial payment RM ${fmt(paid)} received. Balance RM ${fmt(outstanding)} to be settled via ${balanceMethod}.`;
+      tx = {
+        type:"receipt", date:el("f-date").value||new Date().toLocaleDateString("en-MY"),
+        reference:el("f-invno").value||"", clientName:el("f-client").value.trim(),
+        description:el("f-desc").value.trim()||"", amount:paid, amountDue:due,
+        amountTendered:paid, changeDue:0, outstandingBalance:outstanding,
+        balanceMethod, remarks, paymentType:"Partial",
+        cashierName:selectedCashier, category:"Sales / Cash Revenue", docType, currency:"RM"
+      };
+    } else {
+      const cash = parseFloat(el("f-tendered").value)||0;
+      tx = {
+        type:"receipt", date:el("f-date").value||new Date().toLocaleDateString("en-MY"),
+        reference:el("f-invno").value||"", clientName:el("f-client").value.trim(),
+        description:el("f-desc").value.trim()||"", amount:cash>due?due:cash,
+        amountDue:due, amountTendered:cash, changeDue:parseFloat((cash-due).toFixed(2)),
+        outstandingBalance:0, balanceMethod:"", remarks:"", paymentType:"Full",
+        cashierName:selectedCashier, category:"Sales / Cash Revenue", docType, currency:"RM"
+      };
+    }
+
+    await addTx(tx);
+    resetForm();
+    if (el("inv-no-label")) el("inv-no-label").textContent = "Invoice No.";
+    const suffix = tx.paymentType === "Partial" ? ` (Partial — ${tx.balanceMethod})` : "";
+    toast(`Recorded — ${tx.clientName} ${RM(tx.amount)}${suffix}`);
+    const sid = localStorage.getItem("sheets_id")||SHEETS_ID_DEFAULT;
+    if (googleToken && sid !== SHEETS_ID_DEFAULT) syncSheets();
+  };
+
+  let selectedExpCashier = "";
+
+  function renderCashierBtns() {
+    // Cash In dropdown
+    const dd = el("cashier-dropdown");
+    if (dd) {
+      const prev = dd.value || selectedCashier;
+      dd.innerHTML = '<option value="">— Select cashier —</option>';
+      cashiers.forEach(name => {
+        const o = document.createElement("option");
+        o.value = name; o.textContent = "👤 " + name;
+        if (name === prev) o.selected = true;
+        dd.appendChild(o);
+      });
+      const oth = document.createElement("option");
+      oth.value = "__other__"; oth.textContent = "➕ Others (type name)";
+      dd.appendChild(oth);
+    }
+    // Header select
+    const sel = el("cashier-select");
+    if (sel) {
+      sel.innerHTML = "";
+      cashiers.forEach(name => {
+        const o = document.createElement("option");
+        o.value = name; o.textContent = name;
+        if (name === selectedCashier) o.selected = true;
+        sel.appendChild(o);
+      });
+    }
+  }
+
+  window.selectCashierFromDropdown = (val) => {
+    if (val === "__other__") {
+      const name = prompt("Enter cashier name:");
+      if (name && name.trim()) { selectedCashier = name.trim(); renderCashierBtns(); }
+      else { el("cashier-dropdown").value = selectedCashier; }
+    } else if (val) {
+      selectedCashier = val;
+    }
+    checkReady();
+  };
+
+  window.selectExpCashier = (val) => {
+    if (val === "__other__") {
+      const name = prompt("Enter cashier name:");
+      if (name && name.trim()) { selectedExpCashier = name.trim(); renderExpCashierBtns(); }
+      else if (el("exp-cashier-dropdown")) el("exp-cashier-dropdown").value = selectedExpCashier;
+    } else {
+      selectedExpCashier = val;
+    }
+  };
+
+  window.renderExpCashierBtns = () => {
+    const dd = el("exp-cashier-dropdown"); if (!dd) return;
+    const prev = dd.value || selectedExpCashier;
+    dd.innerHTML = '<option value="">— Select cashier —</option>';
+    cashiers.forEach(name => {
+      const o = document.createElement("option");
+      o.value = name; o.textContent = "👤 " + name;
+      if (name === prev) o.selected = true;
+      dd.appendChild(o);
+    });
+    const oth = document.createElement("option");
+    oth.value = "__other__"; oth.textContent = "➕ Others (type name)";
+    dd.appendChild(oth);
+  };
+
+  window.addExpense = async () => {
+    const amt = parseFloat(el("exp-amount").value)||0;
+    const desc = el("exp-desc").value.trim();
+    const ref = el("exp-ref").value.trim();
+    const category = el("exp-category").value || "Cash Out (Bank In)";
+    const cashierOut = selectedExpCashier || selectedCashier;
+
+    if (!amt) { toast("Please enter an amount","err"); return; }
+    if (!desc) { toast("Please enter a description","err"); return; }
+    if (!cashierOut) { toast("Please select who took the cash","err"); return; }
+
+    const tx = {
+      type: "payment",
+      date: new Date().toLocaleDateString("en-MY"),
+      reference: ref || "EXP-" + Date.now(),
+      clientName: desc,
+      description: desc,
+      amount: amt,
+      cashierName: cashierOut,
+      category,
+      currency: "RM"
+    };
+    await addTx(tx);
+    el("exp-amount").value = "";
+    el("exp-desc").value = "";
+    el("exp-ref").value = "";
+    selectedExpCashier = "";
+    renderExpCashierBtns();
+    toast(`Cash out recorded — ${RM(amt)} by ${cashierOut}`);
+  };
+
+  function resetForm() {
+    ["f-invno","f-date","f-client","f-amount","f-tendered","f-desc","f-partial"].forEach(id=>{ const e=el(id); if(e) e.value=""; });
+    el("pdf-input").value=""; el("pdf-status").style.display="none";
+    el("change-amt").textContent="RM —"; el("change-sub").textContent="Enter cash amount above";
+    el("change-box").className="change-box"; el("short-warn").style.display="none"; el("btn-record").disabled=true;
+    // Reset payment type to full
+    paymentType = "full";
+    el("pay-full").classList.add("active"); el("pay-partial").classList.remove("active");
+    el("full-pay-section").style.display=""; el("partial-pay-section").style.display="none";
+    el("p-due").textContent="RM —"; el("p-paid").textContent="RM —"; el("p-outstanding").textContent="RM —";
+  }
+
+  // ── STARTING BALANCE ──
+  window.updateStartingBalance = async () => {
+    startingBalance=parseFloat(el("starting-bal-input").value)||0;
+    await saveSettings(); renderStats(); toast("Opening float updated");
+  };
+
+  // ── CASHIERS ──
+  window.selectCashier = (name) => { selectedCashier = name; renderCashierBtns(); checkReady(); };
+  window.addCashier = async () => {
+    const name = el("new-cashier").value.trim();
+    if (!name || cashiers.includes(name)) return;
+    cashiers.push(name); selectedCashier = name; el("new-cashier").value = "";
+    await saveSettings(); renderCashierBtns(); renderExpCashierBtns(); toast(`"${name}" added`);
+  };
+
+  function renderCashierBtns() {
+    const g=el("cashier-grid"); g.innerHTML="";
+    [...cashiers,"Others"].forEach(name=>{
+      const b=document.createElement("button");
+      b.className="cbtn"+(name===selectedCashier?" sel":"");
+      b.innerHTML=`${name==="Others"?"➕":"👤"} ${name}`;
+      b.onclick=()=>{ if(name==="Others"){el("other-row").style.display="flex";}else{el("other-row").style.display="none";selectCashier(name);} };
+      g.appendChild(b);
+    });
+  }
+
+  // ── STATS ──
+  function getStats() {
+    let receipts=0,payments=0;
+    transactions.forEach(tx=>{ if(tx.type==="receipt") receipts+=tx.amount||0; else payments+=tx.amount||0; });
+    return { receipts, payments, net:startingBalance+receipts-payments, count:transactions.length };
+  }
+
+  function renderStats() {
+    const s=getStats();
+    el("stat-float").textContent="RM "+fmt(startingBalance);
+    el("stat-in").textContent="RM "+fmt(s.receipts);
+    el("stat-out").textContent="RM "+fmt(s.payments);
+    el("stat-bal").textContent="RM "+fmt(s.net);
+    el("stat-count").textContent=s.count;
+  }
+
+  // ── LEDGER ──
+  function getFiltered() {
+    return transactions.filter(tx=>{
+      if (filterFlow==="in" && tx.type!=="receipt") return false;
+      if (filterFlow==="out" && tx.type!=="payment") return false;
+      if (filterSearch) {
+        const s=filterSearch.toLowerCase();
+        if (!(tx.clientName||"").toLowerCase().includes(s) && !(tx.reference||"").toLowerCase().includes(s) && !(tx.cashierName||"").toLowerCase().includes(s)) return false;
+      }
+      if (filterFrom && tx.date < filterFrom) return false;
+      if (filterTo && tx.date > filterTo) return false;
+      return true;
+    });
+  }
+
+  function renderTable() {
+    const tbody=el("ledger-tbody"), filtered=getFiltered();
+    el("tx-count").textContent=filtered.length+" items";
+    if (!filtered.length) { tbody.innerHTML=`<tr><td colspan="10" class="empty-row">No transactions found</td></tr>`; return; }
+    let running=startingBalance;
+    tbody.innerHTML=transactions.map(tx=>{
+      const isIn=tx.type==="receipt";
+      if (isIn) running+=tx.amount||0; else running-=tx.amount||0;
+      if (!filtered.includes(tx)) return "";
+      const badge=isIn
+        ?`<span class="badge-in">↙ Receipt Cash IN</span>`
+        :`<span class="badge-out">↗ Payment Cash OUT</span>`;
+      const docType = tx.docType || (isIn ? "Invoice" : "Expense");
+      const docBadge = docType === "Cash Sales Bill"
+        ? `<span class="doc-bill">🧾 Cash Sales Bill</span>`
+        : docType === "Invoice"
+        ? `<span class="doc-invoice">📄 Invoice</span>`
+        : `<span class="doc-expense">💳 ${docType}</span>`;
+      const partialBadge = tx.paymentType === "Partial"
+        ? `<br><span class="doc-partial">⚡ Partial (${tx.balanceMethod}) — RM ${fmt(tx.outstandingBalance)} outstanding</span>`
+        : "";
+      const remarksCell = tx.remarks ? `<span class="remarks-pill" title="${tx.remarks}">📋 ${tx.remarks.substring(0,45)}${tx.remarks.length>45?"…":""}</span>` : "—";
+      return `<tr>
+        <td class="td-mono">${tx.date||"—"}</td>
+        <td>${badge}</td>
+        <td>${docBadge}${partialBadge}</td>
+        <td class="td-mono td-ref">${tx.reference||"—"}</td>
+        <td class="td-client">${tx.clientName||"—"}</td>
+        <td>${tx.cashierName||"—"}</td>
+        <td class="td-mono ${isIn?"amt-in":"amt-out"}">${isIn?"+":"-"}RM ${fmt(tx.amount)}</td>
+        <td class="td-mono td-bal">RM ${fmt(running)}</td>
+        <td class="td-remarks">${remarksCell}</td>
+        <td><button class="del-btn" onclick="confirmDelete('${tx.id}')">✕</button></td>
+      </tr>`;
+    }).join("");
+  }
+
+  window.confirmDelete = async (id) => { if(confirm("Delete this transaction?")){ await deleteTx(id); toast("Deleted"); } };
+  window.setFilter = (flow) => { filterFlow=flow; document.querySelectorAll(".filter-btn").forEach(b=>b.classList.remove("active")); el("filter-"+flow).classList.add("active"); renderTable(); };
+  window.applySearch = () => { filterSearch=el("search-input").value.trim(); filterFrom=el("filter-from").value; filterTo=el("filter-to").value; renderTable(); };
+
+  // ── GOOGLE SHEETS SYNC ──
+  window.syncSheets = async () => {
+    let raw = localStorage.getItem("sheets_id") || el("sheets-id-input")?.value || "";
+    // Extract ID from full URL if pasted
+    const match = raw.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+    const sid = match ? match[1] : raw.trim();
+    if (!sid || sid === SHEETS_ID_DEFAULT || sid === "") { toast("Enter Google Sheet ID in Settings ⚙","err"); return; }
+    if (!googleToken) { toast("Please sign in with Google first to sync Sheets","err"); return; }
+    const statusEl = document.getElementById("sheets-status");
+    if (statusEl) statusEl.textContent="⏳ Syncing…";
+    try {
+      const s=getStats();
+      const values=[
+        ["IM AUTOMATION SDN BHD — CASHBOOK REGISTER"],
+        ["Synced at:", new Date().toLocaleString("en-MY",{timeZone:"Asia/Kuala_Lumpur"})],[],
+        ["Opening Float (RM)",startingBalance],["Total Cash In (RM)",s.receipts],["Total Cash Out (RM)",s.payments],["Balance (RM)",s.net],[],
+        ["Date","Invoice No.","Client","Cashier","Amount (RM)","Tendered (RM)","Change (RM)","Type","Doc Type","Payment Type","Outstanding (RM)","Balance Method","Remarks"],
+        ...transactions.map(tx=>[tx.date||"",tx.reference||"",tx.clientName||"",tx.cashierName||"",tx.amount||0,tx.amountTendered||"",tx.changeDue||"",tx.type==="receipt"?"Cash In":"Cash Out",tx.docType||"",tx.paymentType||"Full",tx.outstandingBalance||0,tx.balanceMethod||"",tx.remarks||""])
+      ];
+      await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sid}/values/A1:M1000:clear`,{method:"POST",headers:{Authorization:`Bearer ${googleToken}`,"Content-Type":"application/json"}});
+      const res=await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sid}/values/A1?valueInputOption=USER_ENTERED`,{method:"PUT",headers:{Authorization:`Bearer ${googleToken}`,"Content-Type":"application/json"},body:JSON.stringify({range:"A1",majorDimension:"ROWS",values})});
+      if (!res.ok) throw new Error("HTTP "+res.status);
+      if (statusEl) statusEl.textContent="✅ Synced "+new Date().toLocaleTimeString();
+      const ind = document.getElementById("sheets-indicator");
+      const ind2 = document.getElementById("sheets-indicator2");
+      if (ind) { ind.textContent="Online"; ind.className="indicator online"; }
+      if (ind2) { ind2.textContent="Online"; ind2.className="indicator online"; }
+      toast("Google Sheets synced ✓");
+    } catch(e) { 
+      if (statusEl) statusEl.textContent="❌ "+e.message; 
+      toast("Sheets error: "+e.message,"err"); 
+    }
+  };
+
+  window.exportCSV = () => {
+    const hdr=["Date","Invoice No","Client","Cashier","Amount","Tendered","Change","Type","Category","Remarks"];
+    const rows=transactions.map(tx=>[tx.date,tx.reference,tx.clientName,tx.cashierName,tx.amount,tx.amountTendered,tx.changeDue,tx.type,tx.category,tx.remarks]);
+    const csv=[hdr,...rows].map(r=>r.map(v=>`"${v||""}"`).join(",")).join("\n");
+    const a=document.createElement("a"); a.href="data:text/csv;charset=utf-8,"+encodeURIComponent(csv);
+    a.download=`cashbook_${new Date().toISOString().split("T")[0]}.csv`; a.click(); toast("CSV exported");
+  };
+
+  window.downloadBackup = () => {
+    const data=JSON.stringify({startingBalance,transactions,cashiers,exportedAt:new Date().toISOString()},null,2);
+    const a=document.createElement("a"); a.href="data:text/json;charset=utf-8,"+encodeURIComponent(data);
+    a.download=`cashbook_backup_${new Date().toISOString().split("T")[0]}.json`; a.click(); toast("Backup downloaded");
+  };
+
+  window.restoreBackup = (input) => {
+    const file=input.files[0]; if(!file) return;
+    const r=new FileReader(); r.onload=async e=>{
+      try {
+        const p=JSON.parse(e.target.result);
+        if (Array.isArray(p.transactions)&&typeof p.startingBalance==="number") {
+          if (currentUser) {
+            await setDoc(doc(db,"settings","main"),{startingBalance:p.startingBalance,cashiers:p.cashiers||cashiers,updatedAt:new Date().toISOString()});
+            for(const tx of p.transactions) await setDoc(doc(db,"transactions",tx.id),tx);
+          } else { transactions=p.transactions; startingBalance=p.startingBalance; if(p.cashiers) cashiers=p.cashiers; renderAll(); }
+          toast("Backup restored ✓");
+        } else { toast("Invalid backup file","err"); }
+      } catch(err) { toast("Could not parse backup","err"); }
+    }; r.readAsText(file); input.value="";
+  };
+
+  window.resetLedger = async () => {
+    if (!confirm("This will erase ALL transactions. Are you sure?")) return;
+    if (currentUser) { for(const tx of transactions) await deleteDoc(doc(db,"transactions",tx.id)); await setDoc(doc(db,"settings","main"),{startingBalance:0,cashiers,updatedAt:new Date().toISOString()}); }
+    else { transactions=[]; startingBalance=0; }
+    renderAll(); toast("Ledger reset");
+  };
+
+  window.togglePanel = (id) => { const p=el(id); p.style.display=p.style.display==="none"?"":"none"; };
+
+  function renderAll() { renderStats(); renderTable(); renderCashierBtns(); renderExpCashierBtns(); }
+
+  window.addEventListener("DOMContentLoaded",()=>{
+    const gk=localStorage.getItem("gemini_key"); if(gk) el("gemini-key-input").value=gk;
+    const sk=localStorage.getItem("sheets_id"); if(sk) el("sheets-id-input").value=sk;
+    el("btn-record").disabled=true;
+    el("filter-all").classList.add("active");
+    renderAll();
+  });
+
+  window.toggleSettings = () => {
+    const p = document.getElementById("settings-panel");
+    p.style.display = p.style.display === "none" ? "block" : "none";
+  };
+  window.saveGeminiKey = () => { localStorage.setItem("gemini_key",el("gemini-key-input").value.trim()); toast("Gemini key saved ✓"); };
+  window.saveSheetsId = () => {
+    let val = el("sheets-id-input").value.trim();
+    const match = val.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+    if (match) val = match[1];
+    localStorage.setItem("sheets_id", val);
+    el("sheets-id-input").value = val;
+    toast("Sheet ID saved ✓");
+  };
+</script>
+
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+*, *::before, *::after { box-sizing:border-box; margin:0; padding:0; }
+:root {
+  --bg:#F8F9FB; --surface:#FFFFFF; --surface2:#F3F4F6;
+  --border:#E5E7EB; --border2:#D1D5DB;
+  --green:#10B981; --green-dark:#059669; --green-bg:#ECFDF5; --green-border:#A7F3D0;
+  --red:#EF4444; --red-bg:#FEF2F2; --red-border:#FECACA;
+  --amber:#F59E0B; --amber-bg:#FFFBEB; --amber-border:#FDE68A;
+  --blue:#3B82F6; --blue-bg:#EFF6FF; --blue-border:#BFDBFE;
+  --text:#111827; --text2:#6B7280; --text3:#9CA3AF;
+  --radius:10px; --radius-lg:16px; --radius-xl:20px;
+  --shadow:0 1px 3px rgba(0,0,0,0.08),0 1px 2px rgba(0,0,0,0.04);
+  --shadow-md:0 4px 12px rgba(0,0,0,0.08);
+}
+body { font-family:'Inter',-apple-system,sans-serif; background:var(--bg); color:var(--text); font-size:14px; line-height:1.5; min-height:100vh; }
+
+/* TOAST */
+.toast { position:fixed; bottom:24px; right:24px; z-index:999; padding:11px 18px; border-radius:var(--radius); font-size:13px; font-weight:600; opacity:0; transform:translateY(6px); transition:all 0.25s; pointer-events:none; max-width:320px; }
+.toast.show { opacity:1; transform:translateY(0); }
+.toast.ok { background:#111827; color:#fff; }
+.toast.err { background:var(--red-bg); color:var(--red); border:1px solid var(--red-border); }
+
+/* HEADER */
+header { background:var(--surface); border-bottom:1px solid var(--border); padding:0 24px; height:58px; display:flex; align-items:center; justify-content:space-between; position:sticky; top:0; z-index:50; gap:12px; box-shadow:var(--shadow); }
+.header-left { display:flex; align-items:center; gap:14px; }
+.logo-wrap { display:flex; align-items:center; justify-content:center; background:#fff; border:1px solid var(--border); border-radius:10px; padding:6px 10px; }
+.logo-wrap img { height:32px; object-fit:contain; }
+.brand-text { border-left:1px solid var(--border); padding-left:14px; }
+.brand-text h1 { font-size:12px; font-weight:800; letter-spacing:0.1em; text-transform:uppercase; color:var(--text); }
+.brand-text p { font-size:10px; color:var(--text3); font-weight:600; letter-spacing:0.08em; text-transform:uppercase; margin-top:1px; }
+.header-right { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.sync-pill { display:flex; align-items:center; gap:7px; padding:7px 14px; border-radius:20px; background:var(--surface2); border:1px solid var(--border); font-size:11px; font-weight:700; }
+#sync-dot { font-size:9px; }
+.btn-login { display:flex; align-items:center; gap:6px; padding:7px 16px; border-radius:20px; border:none; background:var(--green); color:#fff; font-size:12px; font-weight:700; cursor:pointer; font-family:'Inter',sans-serif; transition:background 0.15s; }
+.btn-login:hover { background:var(--green-dark); }
+.btn-hdr { padding:6px 14px; border-radius:var(--radius); border:1px solid var(--border2); background:var(--surface); color:var(--text2); font-size:12px; font-weight:600; cursor:pointer; font-family:'Inter',sans-serif; transition:all 0.15s; }
+.btn-hdr:hover { border-color:var(--text3); color:var(--text); }
+.btn-hdr.danger { color:var(--red); border-color:var(--red-border); }
+.btn-hdr.danger:hover { background:var(--red-bg); }
+.cashier-pill { display:flex; align-items:center; gap:8px; padding:5px 12px; border-radius:var(--radius); border:1px solid var(--border2); background:var(--surface); font-size:12px; color:var(--text2); font-weight:600; }
+.cashier-pill select { border:none; background:transparent; font-size:12px; font-weight:700; color:var(--text); font-family:'Inter',sans-serif; cursor:pointer; outline:none; }
+.user-chip { font-size:11px; color:var(--text2); font-weight:500; }
+
+/* WORKSPACE */
+.workspace { max-width:1400px; margin:0 auto; padding:24px 20px 60px; }
+
+/* STATS */
+.stats-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin-bottom:20px; }
+@media(max-width:900px) { .stats-grid { grid-template-columns:repeat(2,1fr); } }
+.stat-card { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius-xl); padding:20px 22px; box-shadow:var(--shadow); position:relative; overflow:hidden; }
+.stat-card.highlight { background:var(--green); border-color:var(--green); }
+.stat-icon { position:absolute; top:16px; right:16px; width:32px; height:32px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:14px; }
+.stat-label { font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:0.07em; color:var(--text2); margin-bottom:10px; }
+.stat-card.highlight .stat-label { color:rgba(255,255,255,0.75); }
+.stat-value { font-size:28px; font-weight:800; letter-spacing:-1px; color:var(--text); line-height:1; }
+.stat-card.highlight .stat-value { color:#fff; font-size:32px; }
+.stat-value.green { color:var(--green); }
+.stat-value.red { color:var(--red); }
+.stat-sub { font-size:11px; color:var(--text3); margin-top:10px; display:flex; align-items:center; gap:6px; }
+.stat-card.highlight .stat-sub { color:rgba(255,255,255,0.7); }
+.stat-badge { font-size:10px; font-weight:700; padding:2px 8px; border-radius:20px; background:rgba(255,255,255,0.2); color:#fff; }
+.float-edit { display:flex; gap:6px; margin-top:10px; }
+.float-edit input { flex:1; padding:5px 9px; border-radius:8px; border:1px solid var(--border2); font-size:12px; font-family:'Inter',sans-serif; background:var(--surface2); }
+.float-edit input:focus { outline:none; border-color:var(--green); }
+.float-edit button { padding:5px 11px; border-radius:8px; border:none; background:var(--green); color:#fff; font-size:11px; font-weight:700; cursor:pointer; }
+.live-dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--green); margin-right:6px; animation:pulse-dot 1.5s ease-in-out infinite; }
+@keyframes pulse-dot { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:0.5;transform:scale(1.3)} }
+.live-bar-fill { height:100%; background:#fff; border-radius:2px; animation:pulse-bar 2s ease-in-out infinite; }
+@keyframes pulse-bar { 0%,100%{width:30%} 50%{width:80%} }
+.live-row { display:flex; justify-content:space-between; margin-top:10px; }
+.live-row span { font-size:10px; font-weight:800; text-transform:uppercase; letter-spacing:0.07em; color:rgba(255,255,255,0.8); }
+.indicator { font-size:10px; font-weight:700; padding:2px 8px; border-radius:20px; }
+.indicator.online { background:rgba(255,255,255,0.2); color:#fff; }
+.indicator.offline { background:rgba(0,0,0,0.08); color:var(--text3); }
+
+/* MAIN GRID */
+.main-grid { display:grid; grid-template-columns:440px 1fr; gap:20px; align-items:start; }
+@media(max-width:1000px) { .main-grid { grid-template-columns:1fr; } }
+
+/* CARDS */
+.card { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius-xl); padding:22px; box-shadow:var(--shadow); margin-bottom:16px; }
+.card:last-child { margin-bottom:0; }
+.card-header { display:flex; align-items:flex-start; justify-content:space-between; margin-bottom:16px; }
+.card-title { font-size:18px; font-weight:700; letter-spacing:-0.3px; color:var(--text); }
+.card-sub { font-size:12px; color:var(--text2); margin-top:2px; }
+.card-icon { width:38px; height:38px; border-radius:10px; display:flex; align-items:center; justify-content:center; font-size:18px; background:var(--surface2); flex-shrink:0; }
+
+/* UPLOAD */
+.upload-zone { border:1.5px dashed var(--border2); border-radius:var(--radius-lg); padding:28px 16px; text-align:center; cursor:pointer; transition:all 0.15s; margin-bottom:14px; background:var(--surface2); }
+.upload-zone:hover { border-color:var(--green); background:var(--green-bg); }
+.upload-icon-wrap { width:48px; height:48px; background:var(--surface); border:1px solid var(--border); border-radius:50%; display:flex; align-items:center; justify-content:center; margin:0 auto 10px; font-size:22px; }
+.upload-zone h3 { font-size:15px; font-weight:600; margin-bottom:4px; }
+.upload-zone p { font-size:12px; color:var(--text2); }
+.pdf-status { display:none; align-items:center; gap:8px; padding:9px 12px; border-radius:var(--radius); font-size:12px; font-weight:600; margin-bottom:12px; }
+.pdf-status.loading { background:var(--surface2); color:var(--text2); }
+.pdf-status.ok { background:var(--green-bg); color:var(--green-dark); border:1px solid var(--green-border); }
+.pdf-status.err { background:var(--red-bg); color:var(--red); border:1px solid var(--red-border); }
+.spinner { width:14px; height:14px; border:2px solid var(--border2); border-top-color:var(--green); border-radius:50%; animation:spin 0.7s linear infinite; flex-shrink:0; }
+@keyframes spin { to { transform:rotate(360deg); } }
+
+/* FORM */
+.field { margin-bottom:12px; }
+.field label { font-size:11px; font-weight:700; color:var(--text2); display:block; margin-bottom:5px; text-transform:uppercase; letter-spacing:0.05em; }
+.field input, .field select { width:100%; padding:9px 12px; border-radius:var(--radius); border:1px solid var(--border2); font-size:13px; font-family:'Inter',sans-serif; color:var(--text); background:var(--surface); transition:border-color 0.15s; }
+.field input:focus, .field select:focus { outline:none; border-color:var(--green); box-shadow:0 0 0 3px rgba(16,185,129,0.1); }
+.field-row { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+.amount-input { font-size:18px !important; font-weight:700 !important; color:var(--green) !important; }
+
+/* CHANGE BOX */
+.change-box { border-radius:var(--radius-lg); padding:14px 16px; display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; background:var(--surface2); border:1px solid var(--border); }
+.change-box.ok { background:var(--green-bg); border-color:var(--green-border); }
+.change-box.warn { background:var(--red-bg); border-color:var(--red-border); }
+.change-lbl { font-size:12px; font-weight:600; color:var(--text2); }
+.change-sub { font-size:11px; color:var(--text3); margin-top:2px; }
+.change-box.ok .change-lbl { color:var(--green-dark); } .change-box.ok .change-sub { color:var(--green); }
+.change-box.warn .change-lbl { color:var(--red); } .change-box.warn .change-sub { color:var(--red); }
+.change-amt { font-size:22px; font-weight:800; color:var(--text2); letter-spacing:-0.5px; }
+.change-box.ok .change-amt { color:var(--green-dark); }
+.change-box.warn .change-amt { color:var(--red); }
+.short-warn { display:none; align-items:center; gap:6px; background:var(--red-bg); color:var(--red); border-radius:var(--radius); padding:8px 12px; font-size:12px; font-weight:600; margin-bottom:10px; border:1px solid var(--red-border); }
+
+/* CASHIER */
+.cashier-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:6px; margin-bottom:8px; }
+.cbtn { padding:8px 10px; border-radius:var(--radius); border:1px solid var(--border2); background:var(--surface2); color:var(--text2); font-size:12px; font-weight:600; cursor:pointer; font-family:'Inter',sans-serif; transition:all 0.12s; text-align:left; }
+.cbtn:hover { border-color:var(--green); color:var(--green-dark); background:var(--green-bg); }
+.cbtn.sel { border-color:var(--green); background:var(--green-bg); color:var(--green-dark); }
+.other-row { display:none; gap:6px; margin-bottom:8px; }
+.other-row input { flex:1; padding:8px 10px; border-radius:var(--radius); border:1px solid var(--border2); font-size:12px; font-family:'Inter',sans-serif; }
+.other-row button { padding:8px 14px; border-radius:var(--radius); border:none; background:var(--green); color:#fff; font-size:12px; font-weight:700; cursor:pointer; }
+.add-cashier-row { display:flex; gap:6px; margin-top:6px; }
+.add-cashier-row input { flex:1; padding:7px 10px; border-radius:var(--radius); border:1px solid var(--border2); font-size:12px; font-family:'Inter',sans-serif; background:var(--surface2); }
+.add-cashier-row input:focus { outline:none; border-color:var(--green); }
+.add-cashier-row button { padding:7px 14px; border-radius:var(--radius); border:1px solid var(--green-border); background:var(--green-bg); color:var(--green-dark); font-size:12px; font-weight:700; cursor:pointer; }
+
+/* RECORD BTN */
+.record-btn { width:100%; padding:13px; border-radius:var(--radius-lg); border:none; background:var(--text); color:#fff; font-size:14px; font-weight:700; cursor:pointer; font-family:'Inter',sans-serif; transition:all 0.15s; margin-top:6px; letter-spacing:-0.2px; }
+.record-btn:hover { background:#374151; }
+.record-btn:disabled { background:var(--surface2); color:var(--text3); cursor:not-allowed; }
+
+/* SECTION CARDS (sheets, gmail) */
+.service-card { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius-xl); padding:18px 20px; box-shadow:var(--shadow); margin-bottom:12px; }
+.service-header { display:flex; align-items:center; gap:10px; margin-bottom:6px; }
+.service-icon { width:34px; height:34px; border-radius:8px; display:flex; align-items:center; justify-content:center; font-size:18px; background:var(--surface2); flex-shrink:0; }
+.service-label { font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:0.07em; color:var(--text3); }
+.service-title { font-size:15px; font-weight:700; color:var(--text); margin-top:1px; }
+.service-desc { font-size:12px; color:var(--text2); margin-bottom:12px; line-height:1.6; }
+.service-action { width:100%; padding:10px; border-radius:var(--radius); border:none; background:var(--text); color:#fff; font-size:13px; font-weight:700; cursor:pointer; font-family:'Inter',sans-serif; display:flex; align-items:center; justify-content:center; gap:6px; transition:background 0.15s; }
+.service-action:hover { background:#374151; }
+.service-action.green { background:var(--green); }
+.service-action.green:hover { background:var(--green-dark); }
+#sheets-status { font-size:11px; color:var(--text3); margin-top:6px; }
+.settings-row { margin-top:8px; display:flex; gap:6px; }
+.settings-row input { flex:1; padding:7px 10px; border-radius:var(--radius); border:1px solid var(--border2); font-size:12px; font-family:'Inter',sans-serif; background:var(--surface2); color:var(--text); }
+.settings-row input:focus { outline:none; border-color:var(--green); }
+.settings-row button { padding:7px 12px; border-radius:var(--radius); border:1px solid var(--border2); background:var(--surface); color:var(--text2); font-size:12px; font-weight:600; cursor:pointer; }
+
+/* LEDGER */
+.ledger-card { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius-xl); box-shadow:var(--shadow); overflow:hidden; margin-top:20px; }
+.ledger-header { padding:20px 22px 16px; border-bottom:1px solid var(--border); }
+.ledger-title-row { display:flex; align-items:center; gap:12px; margin-bottom:14px; flex-wrap:wrap; }
+.ledger-title { font-size:20px; font-weight:700; letter-spacing:-0.5px; }
+.tx-badge { background:var(--green-bg); color:var(--green-dark); font-size:12px; font-weight:700; padding:4px 12px; border-radius:20px; border:1px solid var(--green-border); }
+.ledger-sub { font-size:12px; color:var(--text2); }
+.ledger-toolbar { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.filter-btn { padding:6px 14px; border-radius:20px; border:1px solid var(--border2); background:var(--surface2); color:var(--text2); font-size:12px; font-weight:600; cursor:pointer; font-family:'Inter',sans-serif; transition:all 0.12s; }
+.filter-btn:hover { border-color:var(--text3); }
+.filter-btn.active { background:var(--text); color:#fff; border-color:var(--text); }
+.search-box { flex:1; min-width:180px; display:flex; align-items:center; gap:6px; background:var(--surface2); border:1px solid var(--border2); border-radius:var(--radius); padding:6px 12px; }
+.search-box input { border:none; background:transparent; font-size:12px; font-family:'Inter',sans-serif; color:var(--text); outline:none; flex:1; }
+.date-filter { display:flex; align-items:center; gap:6px; font-size:12px; color:var(--text2); }
+.date-filter input { padding:5px 8px; border-radius:var(--radius); border:1px solid var(--border2); font-size:12px; background:var(--surface2); color:var(--text); }
+.toolbar-btns { display:flex; gap:6px; margin-left:auto; }
+.toolbar-btn { padding:6px 14px; border-radius:var(--radius); border:1px solid var(--border2); background:var(--surface); color:var(--text2); font-size:12px; font-weight:600; cursor:pointer; font-family:'Inter',sans-serif; transition:all 0.12s; }
+.toolbar-btn:hover { border-color:var(--green); color:var(--green-dark); background:var(--green-bg); }
+.toolbar-btn.dark { background:var(--text); color:#fff; border-color:var(--text); }
+.toolbar-btn.dark:hover { background:#374151; }
+.ledger-wrap { overflow-x:auto; }
+table { width:100%; border-collapse:collapse; font-size:12.5px; }
+th { padding:10px 14px; text-align:left; font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:0.06em; color:var(--text2); background:var(--surface2); border-bottom:1px solid var(--border); white-space:nowrap; }
+td { padding:13px 14px; border-bottom:1px solid var(--border); vertical-align:middle; color:var(--text); }
+tr:hover td { background:#FAFAFA; }
+.badge-in { display:inline-flex; align-items:center; gap:4px; background:var(--green-bg); color:var(--green-dark); font-size:11px; font-weight:700; padding:3px 10px; border-radius:20px; border:1px solid var(--green-border); white-space:nowrap; }
+.doc-partial { display:inline-flex; align-items:center; gap:3px; background:#FEF3C7; color:#92400E; font-size:10px; font-weight:700; padding:2px 7px; border-radius:20px; border:1px solid #FDE68A; white-space:nowrap; margin-top:3px; }
+.pay-toggle { display:flex; gap:6px; }
+.pay-btn { flex:1; padding:9px 12px; border-radius:var(--radius); border:1px solid var(--border2); background:var(--surface2); color:var(--text2); font-size:12px; font-weight:600; cursor:pointer; font-family:'Inter',sans-serif; transition:all 0.15s; }
+.pay-btn:hover { border-color:var(--green); color:var(--green-dark); }
+.pay-btn.active { border-color:var(--green); background:var(--green-bg); color:var(--green-dark); }
+.partial-box { background:var(--surface2); border:1px solid var(--border2); border-radius:var(--radius-lg); padding:14px 16px; margin-bottom:10px; }
+.partial-box.has-outstanding { border-color:var(--red-border); background:var(--red-bg); }
+.partial-row { display:flex; justify-content:space-between; align-items:center; padding:5px 0; font-size:13px; border-bottom:1px solid var(--border); }
+.partial-row:last-child { border-bottom:none; padding-top:8px; margin-top:4px; }
+.partial-row.outstanding { font-weight:700; font-size:14px; }
+.doc-invoice { display:inline-flex; align-items:center; gap:3px; background:#EFF6FF; color:#1D4ED8; font-size:11px; font-weight:700; padding:3px 9px; border-radius:20px; border:1px solid #BFDBFE; white-space:nowrap; }
+.partial-note { font-size:11px; color:var(--text3); background:var(--surface2); border-radius:var(--radius); padding:8px 12px; margin-bottom:10px; line-height:1.6; border:1px solid var(--border); }
+.td-remarks { max-width:180px; }
+.remarks-pill { display:inline-block; font-size:11px; color:var(--text2); background:var(--surface2); padding:3px 8px; border-radius:20px; border:1px solid var(--border); cursor:help; }
+.doc-bill { display:inline-flex; align-items:center; gap:3px; background:#FFFBEB; color:#92400E; font-size:11px; font-weight:700; padding:3px 9px; border-radius:20px; border:1px solid #FDE68A; white-space:nowrap; }
+.doc-expense { display:inline-flex; align-items:center; gap:3px; background:var(--surface2); color:var(--text2); font-size:11px; font-weight:700; padding:3px 9px; border-radius:20px; border:1px solid var(--border); white-space:nowrap; }
+.doc-bill { display:inline-flex; align-items:center; gap:3px; background:#FFFBEB; color:#92400E; font-size:11px; font-weight:700; padding:3px 9px; border-radius:20px; border:1px solid #FDE68A; white-space:nowrap; }
+.doc-expense { display:inline-flex; align-items:center; gap:3px; background:var(--surface2); color:var(--text2); font-size:11px; font-weight:700; padding:3px 9px; border-radius:20px; border:1px solid var(--border); white-space:nowrap; }
+.badge-out { display:inline-flex; align-items:center; gap:4px; background:var(--red-bg); color:var(--red); font-size:11px; font-weight:700; padding:3px 10px; border-radius:20px; border:1px solid var(--red-border); white-space:nowrap; }
+.cat-pill { background:var(--surface2); color:var(--text2); font-size:11px; font-weight:600; padding:3px 9px; border-radius:20px; border:1px solid var(--border); white-space:nowrap; }
+.td-mono { font-family:'SF Mono','Fira Code',monospace; font-size:12px; }
+.td-client { font-weight:600; max-width:160px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.td-desc { color:var(--text2); max-width:140px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.td-ref { color:var(--text2); }
+.amt-in { color:var(--green-dark) !important; font-weight:700; }
+.amt-out { color:var(--red) !important; font-weight:700; }
+.td-bal { color:var(--blue) !important; font-weight:700; }
+.del-btn { padding:3px 8px; border-radius:6px; border:1px solid var(--border2); background:transparent; color:var(--text3); cursor:pointer; font-size:11px; transition:all 0.12s; }
+.del-btn:hover { border-color:var(--red); color:var(--red); background:var(--red-bg); }
+.empty-row { text-align:center; padding:40px !important; color:var(--text3); font-size:13px; }
+
+/* TABS */
+.tab-row { display:flex; gap:4px; background:var(--surface2); border-radius:var(--radius); padding:3px; margin-bottom:16px; }
+.tab-btn { flex:1; padding:7px; border-radius:7px; border:none; background:transparent; font-size:12px; font-weight:600; color:var(--text2); cursor:pointer; font-family:'Inter',sans-serif; transition:all 0.15s; }
+.tab-btn.active { background:var(--surface); color:var(--text); box-shadow:var(--shadow); }
+</style>
+</head>
+<body>
+
+<div id="toast" class="toast"></div>
+
+<!-- HEADER -->
+<header>
+  <div class="header-left">
+    <div class="logo-wrap">
+      <img src="https://irp.cdn-website.com/2253dd39/dms3rep/multi/IM+Automation+LogoArtboard+1.png" alt="IM Automation" onerror="this.style.display='none';this.nextElementSibling.style.display='block'">
+      <span style="display:none;font-weight:800;font-size:13px;color:#111">IM AUTO</span>
+    </div>
+    <div class="brand-text">
+      <h1>Cash Book Ledger</h1>
+      <p>Pahang Head Office Register</p>
+    </div>
+  </div>
+  <div class="header-right">
+    <div class="sync-pill">
+      <span id="sync-dot" style="color:#94a3b8">○</span>
+      <span id="sync-label">Offline</span>
+    </div>
+    <span class="user-chip" id="user-name"></span>
+    <button class="btn-login" id="btn-login" onclick="handleLogin()">
+      <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:rgba(255,255,255,0.6);animation:spin 1.5s linear infinite"></span>
+      Live Team Sync (Google Login)
+    </button>
+    <button class="btn-hdr" id="btn-logout" onclick="handleLogout()" style="display:none">Disconnect</button>
+    <div class="cashier-pill">
+      👤 Duty Cashier:
+      <select id="cashier-select" onchange="selectCashier(this.value)"></select>
+    </div>
+    <label class="btn-hdr" style="cursor:pointer">Restore Workspace<input type="file" accept=".json" style="display:none" onchange="restoreBackup(this)"></label>
+    <button class="btn-hdr" onclick="downloadBackup()">Backup Database</button>
+    <button class="btn-hdr" onclick="toggleSettings()">⚙ Settings</button>
+    <button class="btn-hdr danger" onclick="resetLedger()">Reset Ledger</button>
+  </div>
+</header>
+
+<!-- SETTINGS PANEL -->
+<div id="settings-panel" style="display:none; background:#1E2235; border-bottom:1px solid rgba(255,255,255,0.08); padding:16px 24px;">
+  <div style="max-width:1400px; margin:0 auto; display:grid; grid-template-columns:1fr 1fr; gap:20px;">
+    <div>
+      <div style="font-size:11px;font-weight:700;color:#94A3B8;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:8px">🤖 Gemini API Key (for PDF auto-read)</div>
+      <div style="display:flex;gap:8px">
+        <input type="password" id="gemini-key-input" placeholder="AIzaSy…" style="flex:1;padding:8px 12px;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.08);color:#fff;font-size:13px;font-family:monospace">
+        <button onclick="saveGeminiKey()" style="padding:8px 16px;border-radius:8px;border:none;background:#10B981;color:#000;font-size:12px;font-weight:700;cursor:pointer">Save</button>
+      </div>
+      <div style="font-size:11px;color:#4B5563;margin-top:5px">Get free key at <a href="https://aistudio.google.com/apikey" target="_blank" style="color:#10B981">aistudio.google.com/apikey</a></div>
+    </div>
+    <div>
+      <div style="font-size:11px;font-weight:700;color:#94A3B8;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:8px">📊 Google Sheet ID (for Finance monitoring)</div>
+      <div style="display:flex;gap:8px">
+        <input type="text" id="sheets-id-input" placeholder="Paste Sheet ID or full URL…" style="flex:1;padding:8px 12px;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.08);color:#fff;font-size:13px">
+        <button onclick="saveSheetsId()" style="padding:8px 16px;border-radius:8px;border:none;background:#10B981;color:#000;font-size:12px;font-weight:700;cursor:pointer">Save</button>
+        <button onclick="syncSheets()" style="padding:8px 16px;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:transparent;color:#fff;font-size:12px;font-weight:600;cursor:pointer">Sync Now</button>
+      </div>
+      <div style="font-size:11px;color:#4B5563;margin-top:5px" id="sheets-status">Create a blank Google Sheet → copy ID from URL → paste above</div>
+    </div>
+  </div>
+</div>
+
+<div class="workspace">
+
+  <!-- STATS -->
+  <div class="stats-grid">
+    <div class="stat-card">
+      <div class="stat-icon" style="background:var(--amber-bg);color:var(--amber)">⚖</div>
+      <div class="stat-label">Beginning Float</div>
+      <div class="stat-value" id="stat-float">RM 0.00</div>
+      <div class="float-edit">
+        <input type="number" id="starting-bal-input" placeholder="Set float…" step="0.01" min="0">
+        <button onclick="updateStartingBalance()">Set</button>
+      </div>
+      <div class="stat-sub"><span style="background:var(--surface2);color:var(--text2);font-size:10px;font-weight:700;padding:2px 8px;border-radius:20px">EDITABLE</span> Morning safe float cash</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-icon" style="background:var(--green-bg);color:var(--green)">↙</div>
+      <div class="stat-label">Total Receipts (+)</div>
+      <div class="stat-value green" id="stat-in">RM 0.00</div>
+      <div class="stat-sub"><span style="color:var(--green);font-weight:700">Cash Inflow</span> from invoices and sales</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-icon" style="background:var(--red-bg);color:var(--red)">↗</div>
+      <div class="stat-label">Total Payments (-)</div>
+      <div class="stat-value red" id="stat-out">RM 0.00</div>
+      <div class="stat-sub"><span style="color:var(--red);font-weight:700">Cash Outflow</span> for expenses/costs</div>
+    </div>
+    <div class="stat-card highlight">
+      <div class="stat-icon" style="background:rgba(255,255,255,0.2);color:#fff">💰</div>
+      <div class="stat-label">Cash Balance In Hand</div>
+      <div class="stat-value" id="stat-bal">RM 0.00</div>
+      <div class="live-row">
+        <span>Active Till Drawer</span>
+        <span class="indicator offline" id="sheets-indicator">Offline</span>
+      </div>
+      <div class="live-bar"><div class="live-bar-fill"></div></div>
+    </div>
+  </div>
+
+  <!-- MAIN GRID -->
+  <div class="main-grid">
+
+    <!-- LEFT COLUMN -->
+    <div>
+      <!-- OCR SCANNER CARD -->
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">Invoice OCR Scanner</div>
+            <div class="card-sub">Upload cashier PDFs or raw pictures to record automatically</div>
+          </div>
+          <div class="card-icon">📄</div>
+        </div>
+
+        <!-- TAB: Cash In / Expense -->
+        <div class="tab-row">
+          <button class="tab-btn active" id="tab-in" onclick="switchTab('in')">💚 Cash In</button>
+          <button class="tab-btn" id="tab-out" onclick="switchTab('out')">🔴 Record Expense</button>
+        </div>
+
+        <!-- CASH IN FORM -->
+        <div id="form-in">
+          <div class="upload-zone" onclick="document.getElementById('pdf-input').click()"
+               ondragover="event.preventDefault();this.style.borderColor='var(--green)'"
+               ondragleave="this.style.borderColor=''"
+               ondrop="event.preventDefault();this.style.borderColor='';document.getElementById('pdf-input').files=event.dataTransfer.files;handlePdfUpload(document.getElementById('pdf-input'))">
+            <div class="upload-icon-wrap">☁</div>
+            <h3>Upload Invoice PDF</h3>
+            <p>Drag and drop your receipts here for instant data extraction (PDF, JPEG, or PNG)</p>
+          </div>
+          <input type="file" id="pdf-input" accept=".pdf,.jpg,.jpeg,.png" style="display:none" onchange="handlePdfUpload(this)">
+          <div class="pdf-status" id="pdf-status"></div>
+
+          <div class="field-row">
+            <div class="field"><label id="inv-no-label">Invoice No.</label><input type="text" id="f-invno" placeholder="e.g. 2604172"></div>
+            <div class="field"><label>Date</label><input type="text" id="f-date" placeholder="DD/MM/YYYY"></div>
+          </div>
+          <div class="field"><label>Client name</label><input type="text" id="f-client" placeholder="Client / company name" oninput="checkReady()"></div>
+          <div class="field"><label>Amount due (RM)</label><input type="number" id="f-amount" class="amount-input" placeholder="0.00" step="0.01" min="0" oninput="calcChange()"></div>
+
+          <!-- Payment Type Toggle -->
+          <div class="field">
+            <label>Payment type</label>
+            <div class="pay-toggle">
+              <button class="pay-btn active" id="pay-full" onclick="setPaymentType('full')">✅ Full Payment</button>
+              <button class="pay-btn" id="pay-partial" onclick="setPaymentType('partial')">⚡ Partial Payment</button>
+            </div>
+          </div>
+
+          <!-- Full Payment -->
+          <div id="full-pay-section">
+            <div class="field"><label>Cash tendered by client (RM)</label><input type="number" id="f-tendered" placeholder="0.00" step="0.01" min="0" oninput="calcChange()"></div>
+            <div class="change-box" id="change-box">
+              <div><div class="change-lbl">Change to return</div><div class="change-sub" id="change-sub">Enter cash amount above</div></div>
+              <div class="change-amt" id="change-amt">RM —</div>
+            </div>
+            <div class="short-warn" id="short-warn">⚠️ Cash received is less than amount due</div>
+          </div>
+
+          <!-- Partial Payment -->
+          <div id="partial-pay-section" style="display:none">
+            <div class="field">
+              <label>Partial amount paid (RM)</label>
+              <input type="number" id="f-partial" placeholder="0.00" step="0.01" min="0" oninput="calcPartial()">
+            </div>
+            <div class="partial-box" id="partial-box">
+              <div class="partial-row">
+                <span>Invoice amount</span>
+                <span id="p-due">RM —</span>
+              </div>
+              <div class="partial-row">
+                <span>Paid now</span>
+                <span id="p-paid" style="color:var(--green);font-weight:700">RM —</span>
+              </div>
+              <div class="partial-row outstanding">
+                <span>⚠️ Outstanding balance</span>
+                <span id="p-outstanding" style="color:var(--red);font-weight:700">RM —</span>
+              </div>
+            </div>
+            <div class="field">
+              <label>Balance to be settled by</label>
+              <select id="f-balance-method" onchange="calcPartial()">
+                <option value="">— Select how balance will be paid —</option>
+                <option value="Pay Later (Cash)">⏳ Pay Later (Cash)</option>
+                <option value="Bank Transfer">🏦 Bank Transfer</option>
+                <option value="TNG / E-Wallet">📱 TNG / E-Wallet</option>
+                <option value="Cheque">📝 Cheque</option>
+              </select>
+            </div>
+            <div class="partial-note" id="partial-note">
+              📋 Select how the outstanding balance will be settled
+            </div>
+          </div>
+
+          <div class="field"><label>Description (optional)</label><input type="text" id="f-desc" placeholder="e.g. FAAC gate operators, installation"></div>
+
+          <div class="field">
+            <label>Cashier on duty</label>
+            <select id="cashier-dropdown" onchange="selectCashierFromDropdown(this.value)">
+            </select>
+          </div>
+          <div class="add-cashier-row">
+            <input type="text" id="new-cashier" placeholder="Register new cashier…" onkeydown="if(event.key==='Enter')addCashier()">
+            <button onclick="addCashier()">+ Add</button>
+          </div>
+          <button class="record-btn" id="btn-record" onclick="recordTransaction()">+ Direct Entry</button>
+        </div>
+
+        <!-- EXPENSE FORM -->
+        <div id="form-out" style="display:none">
+          <div class="field"><label>Amount (RM)</label><input type="number" id="exp-amount" class="amount-input" placeholder="0.00" step="0.01" min="0"></div>
+          <div class="field"><label>Category</label>
+            <select id="exp-category">
+              <option value="Cash Out (Bank In)">💳 Cash Out (Bank In)</option>
+              <option value="Staff Meals">🍱 Staff Meals</option>
+              <option value="Delivery Expenses">🚚 Delivery Expenses</option>
+              <option value="Other">📋 Other</option>
+            </select>
+          </div>
+          <div class="field"><label>Description</label><input type="text" id="exp-desc" placeholder="e.g. Bank deposit, staff lunch, courier fee"></div>
+          <div class="field"><label>Reference / Receipt No. (optional)</label><input type="text" id="exp-ref" placeholder="e.g. RCP-001"></div>
+            <select id="exp-cashier-dropdown" onchange="selectExpCashier(this.value)">
+            </select>
+          </div>
+          <button class="record-btn" style="background:var(--red);color:#fff" onclick="addExpense()">Record Cash Out</button>
+        </div>
+      </div>
+
+      <!-- GOOGLE SHEETS CARD -->
+      <div class="service-card">
+        <div class="service-header">
+          <div class="service-icon">📊</div>
+          <div>
+            <div class="service-label">Google Sheets API</div>
+            <div class="service-title">Live Ledger Streaming</div>
+          </div>
+          <span class="indicator offline" id="sheets-indicator2" style="margin-left:auto">Offline</span>
+        </div>
+        <div class="service-desc">Stream every cashier transaction, invoice, change, and drawer float directly into a live Google Sheet for real-time finance monitoring.</div>
+        <div class="settings-row">
+          <input type="text" id="sheets-id-input" placeholder="Google Sheet ID or URL…" onchange="saveSheetsId()">
+          <button onclick="saveSheetsId();toast('Sheet ID saved')">Save</button>
+        </div>
+        <button class="service-action" style="margin-top:10px" onclick="syncSheets()">🔗 Authorize Google Sheets Sync</button>
+        <div id="sheets-status"></div>
+      </div>
+
+      <!-- GMAIL CARD -->
+      <div class="service-card">
+        <div class="service-header">
+          <div class="service-icon">📧</div>
+          <div>
+            <div class="service-label">Gmail Service API</div>
+            <div class="service-title">Automated Alerting</div>
+          </div>
+          <span class="indicator offline" style="margin-left:auto">Via Apps Script</span>
+        </div>
+        <div class="service-desc">Real-time email alerts and daily 6PM summary sent to <strong>acc.imautomationsb@gmail.com</strong> via Google Apps Script on your Sheet.</div>
+        <div class="settings-row">
+          <input type="password" id="gemini-key-input" placeholder="Gemini API key (AIzaSy…)" onchange="saveGeminiKey()">
+          <button onclick="saveGeminiKey()">Save</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- RIGHT COLUMN: LIVE LEDGER -->
+    <div style="position:sticky;top:70px">
+      <div class="ledger-card">
+        <div class="ledger-header">
+          <div class="ledger-title-row">
+            <div class="ledger-title"><span class="live-dot"></span>Live Ledger</div>
+            <span class="tx-badge" id="tx-count">0 items</span>
+          </div>
+          <div class="ledger-sub" style="margin-bottom:12px">Live dynamic balancing ledger sheet (RM Account)</div>
+          <div class="ledger-toolbar">
+            <button class="filter-btn" id="filter-all" onclick="setFilter('all')">All Flows</button>
+            <button class="filter-btn" id="filter-in" onclick="setFilter('in')">Cash In</button>
+            <button class="filter-btn" id="filter-out" onclick="setFilter('out')">Cash Out</button>
+            <div class="search-box">
+              <span style="color:var(--text3)">🔍</span>
+              <input type="text" id="search-input" placeholder="Search ref, client, cashier…" oninput="applySearch()">
+            </div>
+            <div class="date-filter">
+              <span>FROM</span><input type="date" id="filter-from" onchange="applySearch()">
+              <span>TO</span><input type="date" id="filter-to" onchange="applySearch()">
+            </div>
+            <div class="toolbar-btns">
+              <button class="toolbar-btn" onclick="exportCSV()">Export to Excel</button>
+              <button class="toolbar-btn dark" onclick="syncSheets()">☁ Sync Sheets</button>
+            </div>
+          </div>
+        </div>
+        <div class="ledger-wrap" style="max-height:calc(100vh - 220px);overflow-y:auto">
+          <table>
+            <thead>
+              <tr>
+                <th>Ref Date</th>
+                <th>Direction</th>
+                <th>Doc Type</th>
+                <th>Ledger ID</th>
+                <th>Client / Payee</th>
+                <th>Cashier</th>
+                <th>Amount</th>
+                <th>Balance</th>
+                <th>Remarks</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="ledger-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- end main-grid -->
+
+</div><!-- end workspace -->
+
+<script>
+  window.switchTab = (tab) => {
+    document.getElementById('form-in').style.display = tab==='in'?'':'none';
+    document.getElementById('form-out').style.display = tab==='out'?'':'none';
+    document.getElementById('tab-in').className = 'tab-btn'+(tab==='in'?' active':'');
+    document.getElementById('tab-out').className = 'tab-btn'+(tab==='out'?' active':'');
+  };
+
+  // Global settings toggle — must be outside module scope
+  function toggleSettings() {
+    const p = document.getElementById("settings-panel");
+    p.style.display = p.style.display === "none" || p.style.display === "" ? "block" : "none";
+  }
+
+  // Sync cashier select in header
+  const origRender = window.renderCashierBtns;
+  window.renderCashierBtns = function() {
+    if (typeof origRender === 'function') origRender();
+    const sel = document.getElementById('cashier-select');
+    if (!sel) return;
+    sel.innerHTML = '';
+    (window.cashiers||[]).forEach(name => {
+      const o = document.createElement('option');
+      o.value = name; o.textContent = name;
+      if (name === window.selectedCashier) o.selected = true;
+      sel.appendChild(o);
+    });
+  };
+</script>
+
+</body>
+</html>
